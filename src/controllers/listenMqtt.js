@@ -57,13 +57,16 @@ function listenMqtt(defaultFuncs, api, ctx, globalCallback) {
 		globalCallback(null, {
 			type: "fullyReady",
 			isE2EE: needsE2EE
-		});
+	});
 	}
 
 	function scheduleReconnect() {
 		if (ctx._stopListening || !ctx.globalOptions.autoReconnect || ctx._mqttReconnectPending) return;
 		ctx._mqttReconnectPending = true;
-		setTimeout(function () {
+		// Store handle so stopListening can cancel a pending reconnect during shutdown,
+		// preventing a getSeqID→listenMqtt cycle from racing against teardown
+		ctx._mqttReconnectTimer = setTimeout(function () {
+			ctx._mqttReconnectTimer = null;
 			ctx._mqttReconnectPending = false;
 			getSeqID();
 		}, 1000);
@@ -792,20 +795,89 @@ module.exports = function (defaultFuncs, api, ctx) {
 	return function (callback) {
 		class MessageEmitter extends EventEmitter {
 			stopListening(callback) {
-				callback = callback || (() => { });
+				var cb = typeof callback === "function" ? callback : function () {};
+				// Silence all future events synchronously before any async operations —
+				// events emitted during the E2EE/MQTT teardown sequence are dropped
 				globalCallback = identity;
 				ctx._stopListening = true;
-				stopE2EEBridge(ctx);
-				if (ctx.mqttClient) {
-					ctx.mqttClient.unsubscribe("/webrtc");
-					ctx.mqttClient.unsubscribe("/rtc_multi");
-					ctx.mqttClient.unsubscribe("/onevc");
-					ctx.mqttClient.publish("/browser_close", "{}");
-					ctx.mqttClient.end(false, function (...data) {
-						callback(data);
-						ctx.mqttClient = undefined;
-					});
+
+				// Cancel any pending reconnect timer before it fires a new getSeqID cycle.
+				// Without this, a close/error event queued just before stop() arrives could
+				// schedule a reconnect that races against our teardown.
+				if (ctx._mqttReconnectTimer) {
+					clearTimeout(ctx._mqttReconnectTimer);
+					ctx._mqttReconnectTimer = null;
+					ctx._mqttReconnectPending = false;
 				}
+
+				var FORCE_CLOSE_TIMEOUT_MS = 5000;
+				var settled = false;
+
+				function finish() {
+					if (settled) return;
+					settled = true;
+					// Reset all E2EE/MQTT readiness flags so a future re-listen gets a clean slate
+					ctx._socketReady = false;
+					ctx._fullyReadyEmitted = false;
+					ctx._e2eeFullyReady = false;
+					ctx._mqttReconnectPending = false;
+					try { cb(); } catch (_) {}
+				}
+
+				// Guard ensures stopListening always resolves even when MQTT broker
+				// or E2EE client hangs during disconnect (dead TCP, meta-messenger.js stall)
+				var guard = setTimeout(finish, FORCE_CLOSE_TIMEOUT_MS);
+
+				function forceCloseMqtt() {
+					var client = ctx.mqttClient;
+					// Null out ctx.mqttClient BEFORE calling end() so that any close/error
+					// handler still on the event loop that checks ctx.mqttClient won't see
+					// a stale reference and attempt a reconnect
+					ctx.mqttClient = undefined;
+
+					if (!client) {
+						clearTimeout(guard);
+						return finish();
+					}
+
+					// Remove ALL event handlers before calling end() — prevents the
+					// close, error and disconnect handlers from firing during shutdown
+					// and triggering scheduleReconnect or globalCallback with stale data
+					try { client.removeAllListeners(); } catch (_) {}
+
+					// Best-effort graceful notifications; wrapped individually so a
+					// broken publish or unsubscribe doesn't abort the rest of teardown
+					try { client.unsubscribe("/webrtc"); } catch (_) {}
+					try { client.unsubscribe("/rtc_multi"); } catch (_) {}
+					try { client.unsubscribe("/onevc"); } catch (_) {}
+					try { client.publish("/browser_close", "{}"); } catch (_) {}
+
+					// Force-close (true) does not wait for in-flight packets to drain.
+					// This is required when the TCP connection is already dead or when
+					// the broker never ACKs UNSUBACK — end(false) would hang indefinitely.
+					try {
+						client.end(true, function () {
+							clearTimeout(guard);
+							finish();
+						});
+					} catch (_) {
+						clearTimeout(guard);
+						finish();
+					}
+				}
+
+				// Sequence: disconnect E2EE bridge first so meta-messenger.js can flush
+				// any pending frames on its own WebSocket before we tear down MQTT.
+				// stopE2EEBridge() always returns a Promise (resolves immediately when no bridge).
+				stopE2EEBridge(ctx)
+					.then(forceCloseMqtt)
+					.catch(forceCloseMqtt);
+			}
+			stopListeningAsync() {
+				var self = this;
+				return new Promise(function (resolve) {
+					self.stopListening(resolve);
+				});
 			}
 		}
 
