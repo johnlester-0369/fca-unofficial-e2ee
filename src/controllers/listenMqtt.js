@@ -145,6 +145,9 @@ function listenMqtt(defaultFuncs, api, ctx, globalCallback) {
 
 	mqttClient.on('connect', function () {
 		topics.forEach(topicsub => mqttClient.subscribe(topicsub));
+		// Notify consumer of session establishment as a state event — mirrors fca-unofficial's connect
+		// state emission so (err, event, state) callers can react without polling api.isConnected()
+		globalCallback(null, null, { type: "connect", userID: ctx.userID, region: ctx.region });
 
 		var topic;
 		var queue = {
@@ -239,12 +242,14 @@ function listenMqtt(defaultFuncs, api, ctx, globalCallback) {
 	mqttClient.on('close', function () {
 		ctx._socketReady = false;
 		if (ctx._stopListening) return;
+		globalCallback(null, null, { type: "close" });
 		scheduleReconnect();
 	});
 
 	mqttClient.on('disconnect',function () {
 		ctx._socketReady = false;
 		if (ctx._stopListening) return;
+		globalCallback(null, null, { type: "disconnect" });
 		scheduleReconnect();
 	});
 }
@@ -879,16 +884,18 @@ module.exports = function (defaultFuncs, api, ctx) {
 					self.stopListening(resolve);
 				});
 			}
-		}
+	}
 
 		var msgEmitter = new MessageEmitter();
-		globalCallback = (callback || function (error, message) {
+		globalCallback = (callback || function (error, message, state) {
 			if (error) return msgEmitter.emit("error", error);
+			// State events (connect/close/disconnect) are lifecycle signals — route to "state" channel
+			if (state) return msgEmitter.emit("state", state);
 			msgEmitter.emit("message", message);
 		});
 
 		var rawCallback = globalCallback;
-		globalCallback = function (error, message) {
+		globalCallback = function (error, message, state) {
 			if (!error && message && message.type === "e2ee_fully_ready") {
 				ctx._e2eeFullyReady = true;
 				if (ctx._socketReady && !ctx._fullyReadyEmitted) {
@@ -905,7 +912,7 @@ module.exports = function (defaultFuncs, api, ctx) {
 				ctx._fullyReadyEmitted = false;
 			}
 
-			return rawCallback(error, message);
+			return rawCallback(error, message, state);
 		};
 
 		//Reset some stuff
